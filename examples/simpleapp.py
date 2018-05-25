@@ -3,8 +3,11 @@ from tendermint import TendermintApp
 from tendermint.utils import (
     home_dir,
     int_to_big_endian,
-    big_endian_to_int
+    big_endian_to_int,
+    to_hex
 )
+from tendermint.keys import Key
+from tendermint.accounts import Account
 
 ## NOTE: THIS IS BROKEN - needs updated
 
@@ -22,7 +25,14 @@ app.debug = True
 # this is a good place to put stuff in state like default accounts, storage, etc...
 @app.on_initialize()
 def create_count(db):
+    app.log.debug('create count')
     db.put_data(DATA_KEY, INITIAL_COUNT)
+
+    # create default accounts
+    sender_key = Key.generate(b'584f84070d4022eb08933d28a562de6a')
+    sender_acct = Account.create_account(sender_key.publickey(),0,100)
+    app.log.debug( to_hex(sender_acct.address()) )
+    db.update_account(sender_acct)
 
 # Add more or more of these.  This is your business logic to change state.
 # In this example, Txs with a 'call' of 'counter' will increment the count

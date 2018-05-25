@@ -10,9 +10,16 @@ from abci import (
     BaseApplication,
     ResponseInfo,
     ResponseQuery,
-    Result
+    ResponseCommit,
+    ResponseCheckTx,
+    ResponseDeliverTx,
+    ResponseInitChain,
+    ResponseBeginBlock,
+    CodeTypeOk
 )
-from abci.types_pb2 import OK, InternalError
+# from abci.types_pb2 import OK, InternalError
+
+InternalError=10
 
 from .keys import Key
 from .transactions import Transaction
@@ -52,9 +59,9 @@ def setup_app_state(root_dir):
         msg = "Cannot find tendermint directory {}".format(root_dir)
         raise FileNotFoundError(msg)
 
-    tm_genesis = os.path.join(root_dir, 'genesis.json')
+    tm_genesis = os.path.join(root_dir, 'config', 'genesis.json')
     if not os.path.exists(tm_genesis):
-        msg = "Cannot find tendermint genesis file in {}".format(root_dir)
+        msg = "Cannot find tendermint genesis file in {}".format(tm_genesis)
         raise FileNotFoundError(msg)
 
     genesis_chain_id = ''
@@ -62,9 +69,9 @@ def setup_app_state(root_dir):
         info = json.loads(gf.read())
         genesis_chain_id = info['chain_id']
 
-    dbname = os.path.join(root_dir, "{}.vdb".format(genesis_chain_id))
+    dbname = os.path.join(root_dir, 'data', "{}.db".format(genesis_chain_id))
 
-    state, is_new  = State.load_state(dbname)
+    state, is_new  = State.load_state()
 
     state.chain_id = str_to_bytes(state.chain_id)
     genesis_chain_id = str_to_bytes(genesis_chain_id)
@@ -196,11 +203,15 @@ class TendermintApp(BaseApplication):
         self.log.debug("init_chain validators: {}".format(validators))
         # First run create state
         state, is_new = setup_app_state(self.rootdir)
+        self.log.debug(self.rootdir)
+        self.log.debug("is_new: {}".format(is_new))
+
         self._storage = Storage(state)
         if is_new and self._on_init:
             self._on_init(self._storage.confirmed)
             # Commit the data so it's available
             self._storage.state.save()
+        return ResponseInitChain()
 
     def info(self, req):
         # Load state
@@ -215,50 +226,50 @@ class TendermintApp(BaseApplication):
         result.version = self.version
         return result
 
-    def check_tx(self, req):
+    def check_tx(self, tx):
         # Decode Tx
-        decoded_tx = self.__decode_incoming_tx(req.check_tx.tx)
+        decoded_tx = self.__decode_incoming_tx(tx)
 
         # Get the account for the sender
         # We use unconfirmed cache to allow multiple Tx per block
         if not decoded_tx.sender:
-            return Result.error(code=InternalError, log="No Sender - is the Tx signed?")
+            return ResponseCheckTx(code=InternalError, log="No Sender - is the Tx signed?")
 
         acct = self._storage.unconfirmed.get_account(decoded_tx.sender)
         if not acct:
-            return Result.error(code=InternalError, log="Account not found")
+            return ResponseCheckTx(code=InternalError, log="Account not found")
 
         # Check the nonce
         if acct.nonce != decoded_tx.nonce:
-            return Result.error(code=InternalError, log="Bad nonce")
+            return ResponseCheckTx(code=InternalError, log="Bad nonce")
 
         # increment the account nonce
         self._storage.unconfirmed.increment_nonce(decoded_tx.sender)
 
         # verify the signature
         if not Key.verify(acct.pubkey, decoded_tx.signature):
-            return Result.error(code=InternalError, log="Invalid Signature")
+            return ResponseCheckTx(code=InternalError, log="Invalid Signature")
 
         # Check if this is a value transfer, if so make sure sender has an
         # acct balance > tx.value
         if decoded_tx.value > 0 and acct.balance < decoded_tx.value:
-            return Result.error(code=InternalError, log="Insufficient balance for transfer")
+            return ResponseCheckTx(code=InternalError, log="Insufficient balance for transfer")
 
-        return Result.ok()
+        return ResponseCheckTx(code=CodeTypeOk)
 
-    def deliver_tx(self, req):
-        tx = self.__decode_incoming_tx(req.deliver_tx.tx)
+    def deliver_tx(self, tx):
+        tx = self.__decode_incoming_tx(tx)
         if not tx.call in self._tx_handlers:
-            return Result.error(code=InternalError, log="No matching Tx handler")
+            return ResponseDeliverTx(code=InternalError, log="No matching Tx handler")
 
         if not self._tx_handlers[tx.call](tx, self._storage.confirmed):
-            return Result.error(code=InternalError,log="Tx Handler returned false or None")
+            return ResponseDeliverTx(code=InternalError,log="Tx Handler returned false or None")
 
-        return Result.ok()
+        return ResponseDeliverTx(code=CodeTypeOk)
 
     def query(self, req):
-        path = str_to_bytes(req.query.path)
-        key = req.query.data
+        path = str_to_bytes(req.path)
+        key = req.data
 
         if not path:
             self.log.error("Missing path value")
@@ -270,6 +281,7 @@ class TendermintApp(BaseApplication):
         # Format ints to big_endianss
         def format_if_needed(value):
             if isinstance(value, int):
+                self.log.error(value)
                 return int_to_big_endian(value)
             else:
                 return value
@@ -278,22 +290,24 @@ class TendermintApp(BaseApplication):
         if path == b'/tx_nonce':
             # Query account in the unconfirmed cache
             acct = self._storage.unconfirmed.get_account(key)
-            return ResponseQuery(code=OK, value=format_if_needed(acct.nonce))
+            return ResponseQuery(code=CodeTypeOk, value=format_if_needed(acct.nonce))
 
         # Try the handler(s)
         if path in self._query_handlers:
             bits = self._query_handlers[path](key, self._storage.confirmed)
-            return ResponseQuery(code=OK, value=format_if_needed(bits))
+            return ResponseQuery(code=CodeTypeOk, value=format_if_needed(bits))
 
         errmsg = "No handler found for {}".format(path)
         return ResponseQuery(code=InternalError, value=str_to_bytes(errmsg))
 
-    def commit(self, req):
+    def commit(self):
         apphash = self._storage.commit()
-        return Result.ok(data=h)
+        return ResponseCommit(data=apphash)
 
     def begin_block(self, req):
-        self._storage.state.last_block_height = req.begin_block.header.height
+        self._storage.state.last_block_height = req.header.height
+        self.log.debug("Begin block: {}".format(req.header.height))
+        return ResponseBeginBlock()
 
     def no_match(self, req):
         return to_response_exception("Unknown ABCI request!")

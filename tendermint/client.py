@@ -49,13 +49,11 @@ class RpcClient(object):
 
         response = r.content
 
+        response = json.loads(response)
 
-        if is_string(response):
-            response = json.loads(bytes_to_str(response))
-
-        if response["error"]:
+        if response.get("error"):
             raise ValueError(response["error"])
-        return response['result']
+        return json.dumps(response['result'])
 
     @property
     def is_connected(self):
@@ -105,8 +103,9 @@ class RpcClient(object):
         return self.call('commit', [height])
 
     def query(self, path, data, proof=False):
+        print("{}: {}".format(path,data))
         d = to_hex(data)
-        return self.call('abci_query', [path, d[2:], proof])
+        return self.call('abci_query', [path, d[2:], 0, proof])
 
     def _send_transaction(self, name, tx):
         if is_bytes(tx):
